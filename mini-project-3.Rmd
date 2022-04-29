@@ -1,0 +1,506 @@
+---
+title: "Mini Project 3: Propery Values in Ramsey County: A Spatial Analysis"
+author: "Jay Anderson, Freddy Barragan, and Ben Christensen"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document:
+    number_sections: yes
+header-includes:
+- \usepackage{titling}
+- \pretitle{\begin{flushleft}\huge\bfseries}
+- \posttitle{\end{flushleft}}
+- \preauthor{\begin{flushleft}\large}
+- \postauthor{\end{flushleft}}
+- \predate{\begin{flushleft}\large}
+- \postdate{\end{flushleft}}
+- \usepackage{framed}
+geometry: margin=1in
+bibliography: Library.bib
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, error=TRUE, warning=FALSE, message=FALSE, fig.align = "center")
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(sf) #install.packages('sf')
+library(spdep) #install.packages('spdep')
+library(janitor)
+library(tidycensus)
+library(broom)
+library(spatialreg)
+library(kableExtra)
+```
+
+# Introduction
+
+Ramsey County, Minnesota, was formed and built upon a foundation of racist, settler-colonial violence; settlers first stole this county’s land from Ojibway and Sioux peoples in 1837 and 1851 [@fairchild1905sketches], then appropriated it into sites of violence upon minoritized peoples over the decades. Structural racism— redlining, racial covenants, and racial violence— has profoundly shaped the demographic composition of modern neighborhoods throughout Ramsey County and fomented present racial disparities. 
+
+
+In the early to mid-twentieth century, the percentage of White-only districts increased and consequently forced African-American communities into 'hazardous' neighborhoods that have had lasting effects on their health, safety, and liberty [@kaplan]. Although many of these neighborhoods exist today—  Northend, Frogtown, and Summit-University— and their demographic compositions have changed dramatically, the lasting effects of structural and environmental racism have been disastrous on racialized communities [@kaplan]. In light of Ramsey County's past and the current effects of gentrification on minoritized communities,  it is critical that we— as statisticians and people— characterize and advocate against the lasting impacts of these discriminatory practices. As such, we aim to characterize the economic geography of housing throughout Ramsey County. We used economic, geographic, and demographic data drawn from the 2015-2019 American Community Survey to model average house prices across census tracts using spatial statistical regression to adjust for the implicit correlation between nearby census tracts.
+
+\
+\
+
+# Data
+
+```{r, message=FALSE, results=FALSE, warning=FALSE}
+load('SpatialData.RData')
+
+ramsey_data <- ramsey_data %>%
+  clean_names()
+
+census_api_key("0cc07f06386e317f312adef5e0892b0d002b7254")
+
+VARS <- c(gini = "B19083_001", below_poverty_100 = "B06012_002", yearseduc ="B15003_001")
+
+ramsey_quant <- get_acs(state = "MN", county = "Ramsey", geography = "tract", 
+                  variables = VARS, geometry = TRUE, output='wide')%>% 
+  dplyr::select(-c(NAME, ends_with("M"))) %>%
+         rename_at(vars(ends_with("E")), .funs = list(~str_sub(., end = -2)))  %>%
+  as_tibble() %>%
+  select(-geometry)%>%
+  clean_names()
+
+ramsey_data <- ramsey_data %>%
+  left_join(.,ramsey_quant, by="geoid") %>%
+  mutate(poverty_perc= below_poverty_100/pop_e)
+  
+ramsey_data <- ramsey_data %>%
+  mutate(perc_nonwhite = 1-race_white_alone)
+```
+
+Using the `Tidycensus` R package [@census_data], we pulled demographic, geographic, and economic data across Ramsey County at the census tract level from the 2019 American Community Survey (ACS; N=135). The ACS is a longform survey conducted by the U.S. Census Bureau that aims to continually track the economic, demographic, and social development of neighborhoods across the United States in a 12-month period. As such, this data is an aggregation of responses in each census tract which is necessarily different from other aggregation levels (e.g. census block, census group, SIP code tabulation areas, etc.); across aggregation levels, census tracts are typically preferred by geographers because sample sizes are relatively homogeneous between tracts and provides one of the most granular levels of data. In addition to census data, `Tidycensus` also provides associated shapefiles for each reported census tract.
+
+As our project aims to model mean household property values per tract by broad structural factors we used multiple variables encoding the economic, demographic, and mobility-related characteristics of each neighborhood. We specifically used:
+
+- **Percent Non-White:** In order to account for uniformly small sizes of racial/ethnic groups throughout Ramsey County, we used this broader variable to measure the proportion of all racial/ethnic minorities in a census tract. This is equivalent to
+$1-\% \text{White}$. 
+	+ We performed a log transformation on this variable to account for an apparent nonlinear relationship to expected household property values.
+- **Average Age:** The average age of residents living in a defined census tract.
+- **Median Income:** The median income value of residents living in a defined census tract.
+- **Gini Index:** Income inequality measured by the Gini Index per census tract
+- **Highway Presence:** Indicator variable describing the presence of at least one highway within a census tract.
+- **Average Household Size:** The average household size of all homes in a defined census tract.
+
+Following exploratory analysis, we added an indicator variable for census tract 27123040601; this census tract encompasses North Oaks, Minnesota— a private community whose economic composition is vastly different from surrounding areas. It is also demographically distinct from the tracts in St Paul proper. Not only that, but being a private community ups the prices of all the houses in the community in such a way that our model wouldn't be able to predict without singling out the tract.
+\
+\
+
+# Methods
+
+Ordinary least squares (OLS) regression is a standard statistical approach that models variable outcomes using a set of explanatory predictors. While OLS is sufficient in various situations, this technique imposes strict assumptions on the independence of data— namely, that data cannot be correlated. This independence assumptions is, however, inappropriate when analyzing spatial data because of the latent effects that space and geography can have on observations. In other words, if we were to model average property values in any given census tract using an OLS model, we would fail to account for the influence that neighboring census tracts would have on the outcome.
+
+Neighborhood network structures (NNS) are formal mathematical objects that describe the connections between points or objects; they are especially critical in spatial data analysis so that we can encode how observations are correlated between each other in space. Considering a map, if two census tracts share a physical border (i.e. a whole line segment) or touch each other at a single point (i.e. a corner), a Queen NNs would state that these census tracts are 'neighbors' (i.e. they are similar to each other). Other neighborhood structures exist and are generally more conservative in their assessment of neighbor-status. For example, the Rook NNS would only consider census tracts that share a border 'neighbors', while a KNN structure would assign tracts neighbor-status according to their relative distances from one and other. We could further adjust any of these described NNS to adjust for the presence of substantial geographic/social barriers to produce penalized NNS that minimize the occurrence of tracts being naively-classified as neighbors, simply because they share a border.
+
+In this analysis, we used a penalized Queen NNS to model the connections between census tracts, penalizing the connections between tracts that have a highway running between them. While we tested other NNSs— e.g. Rooks, KNNs, and their penalized parallels— this penalized Queen NNS was most appropriate given its generality and the historical role that highways played throughout the Twin Cities: separate and segregate communities. As such, we do not expect the characteristics of communities in census tracts bordered by highways— especially the I-94 Highway— to be very similar. 
+
+The simultaneous autoregressive (SAR) model is a spatial regression technique that extends standard regression frameworks to account for underlying spatial relationships between observations in a dataset by using an underlying NNS to impose spatial weights on observations [@whittle1954stationary; @hooten2014simultaneous; @wall2004close; @brianna]. The conditional autoregressive (CAR) model is another spatial regression technique that also adjusts for underlying spatial correlation between observations, but in a manner that is distinct from SAR models [@besag1974spatial; @wall2004close; @brianna]. Specifically, CAR models assume a Markov property or 'memorylessness' to the relationship between neighbors and thus impose weaker spatial correlation structures than SAR models [@wall2004close]. The relative benefits of CAR and SAR models are highly contextual and specific to the data and problem at hand. 
+
+In this analysis, we used a SAR model to predict average property values within census tracts. We define our proposed model below:
+
+$$\textbf{Y}=\lambda\boldsymbol{WY}+\boldsymbol{X\beta}+\boldsymbol{\epsilon}$$
+where 
+
+
+\begin{itemize}
+  \item $Y$ is the vector of mean house prices for all $135$ census tracts. 
+  \item $\lambda\boldsymbol{WY}$ is a matrix product of some constant $\lambda$, our penalized proximity matrix $W$, and a matrix of housing values for all neighborhoods $Y$.
+  \item $\boldsymbol{X\beta}$ is the product of the $135 \times 8$ covariate matrix— where entries of this matrix are the observed values of the $8$ predictors (columns) for the $135$ different census tracts (rows) in our data— and a $1 \times 8$ coefficient vector.
+  \item $\boldsymbol{\epsilon}$ is the matrix of our tract-specific error terms with $\boldsymbol{\epsilon} \sim N(0,\sigma ^2I)$
+\end{itemize}
+
+
+Outside of this analysis, we performed model selection between our model and OLS and CAR analogs of our model, using standard evaluation metrics: 
+
+- Residual mapping
+- Bayesian Information Criterion (BIC) metrics 
+- Moran's I Test Statistics of Residuals
+
+Uniformly, our SAR model performed better with respect to these evaluation metrics, however we exclude substantial discussion of the relative performance of models in this analysis. Additionally, because historical information on Ramsey County [@kaplan] substantiates a very strong spatial dimension to neighborhood housing prices, SAR models' stronger assumptions about the spatial correlation between census tracts are more appropriate. 
+
+\
+\
+
+# Results
+
+```{r, fig.height=5*1.2, fig.width=5*1.2}
+# For Brianna:
+## We performed this same ggplot setup on the remaining predictors in our model, 
+## but we hid their code chunks to conserve space in this document
+price<-ramsey_data %>%
+  ggplot() +
+  geom_sf(aes(fill=(house_value_e/1000)), color = NA) +
+  scale_fill_gradientn(colors = c("#C9DEDA", "#80CECB", "#26A393", "#327169")) +
+ geom_sf(data=colleges_sub) +
+  geom_sf(data=areawater, color="#D6F3FF", fill="#D6F3FF") +
+    geom_sf(data=roads_sub) +  ggtitle("House Prices")+
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_line("transparent"),
+        panel.background = element_blank(),
+        plot.title = element_text(color="black",  size = 20, face = "bold", hjust=.5),
+        legend.key.width = unit(.5, "in"),
+        legend.title = element_text(color="black", size = 12, face="bold",  hjust=.5),
+        legend.position = "bottom",
+        legend.direction="horizontal",
+        legend.text = element_text(color="black", size = 12, face="bold"))+
+    guides(fill = guide_colourbar(title = "Dollars (per 1000)", 
+                                  title.position="top", hjust=.5))
+```
+
+```{r, fig.height=5*1.2, fig.width=5*1.2, echo=FALSE}
+income<-ramsey_data %>%
+  ggplot() +
+  geom_sf(aes(fill=(income_e/1000)),  color = NA) +
+  geom_sf(data=colleges_sub) +
+  geom_sf(data=areawater, color="#D6F3FF", fill="#D6F3FF") +
+    geom_sf(data=roads_sub) +
+  scale_fill_gradientn(colors = c("#FCF5EE","#919BB6", "#5A6687", "#3D465C")) +
+  ggtitle("Income")+
+  geom_sf(data=colleges_sub) +
+  geom_sf(data=areawater, color="#D6F3FF", fill="#D6F3FF") +
+    geom_sf(data=roads_sub) +
+  scale_fill_gradientn(colors = c("#FCF5EE","#c1c9de", "#7d8bb0", "#3D465C")) +
+  ggtitle("Median Income")+
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_line("transparent"),
+        panel.background = element_blank(),
+        plot.title = element_text(color="black",  size = 20, face = "bold", hjust=.5),
+        legend.key.width = unit(.5, "in"),
+        legend.title = element_text(color="black", size = 12, face="bold",  hjust=.5),
+        legend.position = "bottom",
+        legend.direction="horizontal",
+        legend.text = element_text(color="black", size = 12, face="bold"))+
+    guides(fill = guide_colourbar(title = "Income ($1000)", title.position="top", hjust=.5))
+```
+
+```{r, echo=FALSE}
+nonwhite<-ramsey_data %>%
+  ggplot() +
+  geom_sf(aes(fill=((1-race_white_alone)*100)),  color = NA) +
+  scale_fill_gradientn(colors = c("#FDE8E9","#E3BAC6", "#BC9EC1", "#2B2D42")) +
+ geom_sf(data=colleges_sub) +
+  geom_sf(data=areawater, color="#D6F3FF", fill="#D6F3FF") +
+    geom_sf(data=roads_sub) +  ggtitle("Percent Non-White")+
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_line("transparent"),
+        panel.background = element_blank(),
+        plot.title = element_text(color="black",  size = 20, face = "bold", hjust=.5),
+        legend.key.width = unit(.5, "in"),
+        legend.title = element_text(color="black", size = 12, face="bold",  hjust=.5),
+        legend.position = "bottom",
+        legend.direction="horizontal",
+        legend.text = element_text(color="black", size = 12, face="bold"))+
+    guides(fill = guide_colourbar(title = "Percent", title.position="top", hjust=.5))
+```
+
+```{r, echo=FALSE}
+age<-ramsey_data %>%
+  ggplot() +
+  geom_sf(aes(fill=(age_e)), color = NA) +
+  scale_fill_gradientn(colors = c("#F0B8AA","#F88877", "#E3626F", "#ED74A9")) +
+ geom_sf(data=colleges_sub) +
+  geom_sf(data=areawater, color="#D6F3FF", fill="#D6F3FF") +
+    geom_sf(data=roads_sub) +  ggtitle("Average Age")+
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_line("transparent"),
+        panel.background = element_blank(),
+        plot.title = element_text(color="black",  size = 20, face = "bold", hjust=.5),
+        legend.key.width = unit(.5, "in"),
+        legend.title = element_text(color="black", size = 12, face="bold",  hjust=.5),
+        legend.position = "bottom",
+        legend.direction="horizontal",
+        legend.text = element_text(color="black", size = 12, face="bold"))+
+    guides(fill = guide_colourbar(title = "Years", title.position="top", hjust=.5))
+```
+
+
+```{r, echo=FALSE}
+size<-ramsey_data %>%
+  ggplot() +
+  geom_sf(aes(fill=(household_size_e)),  color = NA) +
+  scale_fill_gradientn(colors = c("#C6D8FF","#71A9F7", "#6B5CA5", "#72195A")) +
+ geom_sf(data=colleges_sub) +
+  geom_sf(data=areawater, color="#D6F3FF", fill="#D6F3FF") +
+    geom_sf(data=roads_sub) +  ggtitle("Average Household Size")+
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_line("transparent"),
+        panel.background = element_blank(),
+        plot.title = element_text(color="black",  size = 20, face = "bold", hjust=.5),
+        legend.key.width = unit(.5, "in"),
+        legend.title = element_text(color="black", size = 12, face="bold",  hjust=.5),
+        legend.position = "bottom",
+        legend.direction="horizontal",
+        legend.text = element_text(color="black", size = 12, face="bold"))+
+    guides(fill = guide_colourbar(title = "Average Size", title.position="top", hjust=.5))
+```
+
+
+```{r, echo=FALSE}
+gini<-ramsey_data %>%
+  ggplot() +
+  geom_sf(aes(fill=gini),  color = NA) +
+  scale_fill_gradientn(colors = c("#EFDCA9","#F8C55D", "#E49B62", "#ED8074")) +
+ geom_sf(data=colleges_sub) +
+  geom_sf(data=areawater, color="#D6F3FF", fill="#D6F3FF") +
+    geom_sf(data=roads_sub) +  ggtitle("Gini Index")+
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_line("transparent"),
+        panel.background = element_blank(),
+        plot.title = element_text(color="black",  size = 20, face = "bold", hjust=.5),
+        legend.key.width = unit(.5, "in"),
+        legend.title = element_text(color="black", size = 12, face="bold",  hjust=.5),
+        legend.position = "bottom",
+        legend.direction="horizontal",
+        legend.text = element_text(color="black", size = 12, face="bold"))+
+    guides(fill = guide_colourbar(title = "Gini Index", title.position="top", hjust=.5))
+```
+
+```{r, fig.height=5*2, fig.width=5*3, echo = TRUE}
+library(ggpubr)
+
+ggarrange(price, income, nonwhite, age, size, gini,  ncol=3, nrow=2)
+
+```
+
+```{r, echo = FALSE}
+size <- ramsey_data %>%
+  ggplot(aes(y=house_value_e/1000, x=household_size_e)) +
+  geom_point() +
+  theme_classic() +
+  labs(title="Average Household Size", x= "Average Household Size", 
+       y="Median House Value ($1000)")+
+  theme(plot.title = element_text(color="black",  size = 12, face = "bold", 
+                                  hjust=.5))
+```
+
+
+```{r, echo = FALSE}
+age <- ramsey_data %>%
+  ggplot(aes(y=house_value_e/1000, x=age_e)) +
+  geom_point() +
+  theme_classic() +
+  labs(title="Average Age", x= "Average Age", y="Median House Value ($1000)")+
+  theme(plot.title = element_text(color="black",  size = 12, face = "bold", 
+                                  hjust=.5))
+```
+
+```{r, echo = FALSE}
+income <- ramsey_data %>%
+  ggplot(aes(y=house_value_e/1000, x=income_e/1000)) +
+  geom_point() +
+  theme_classic() +
+  labs(title="Median Income", x= "Median Income ($1000)", 
+       y="Median House Value ($1000)")+
+  theme(plot.title = element_text(color="black",  size = 12, face = "bold", 
+                                  hjust=.5))
+
+```
+
+```{r, echo = FALSE}
+gini <- ramsey_data %>%
+  ggplot(aes(y=house_value_e/1000, x=gini)) +
+  geom_point() +
+  theme_classic() +
+  labs(title="Income Inequality", x= "Gini Index",
+       y="Median House Value ($1000)")+
+  theme(plot.title = element_text(color="black", 
+                                  size = 12, face = "bold", hjust=.5))
+```
+
+
+```{r, echo = FALSE}
+nonwhite <- ramsey_data %>%
+  ggplot(aes(y=house_value_e/1000, x=log(perc_nonwhite))) +
+  geom_point() +
+  theme_classic() +
+  labs(title="Log(Percent Non-White)", 
+       x= "Log Percent (%) Non-White", y="Median House Value ($1000)")+
+  theme(plot.title = element_text(color="black",  
+                                  size = 12, face = "bold", hjust=.5))
+```
+
+
+
+
+```{r, fig.height=2.5*2, fig.width=2.5*3, echo= FALSE}
+scatter_arrange <- ggarrange(NULL, income, nonwhite, age, size, gini,  ncol=3, nrow=2)
+```
+
+The geography of housing prices indicates the presence of a spatial dimension at play in Ramsey County. From the map, it appears that housing is consistently cheaper in the Midway district and along the I-94 Highway, while housing is generally much more expensive in census tracts below the I-94 Highway in South Western Ramsey County. Average property values were consistently cheaper in the Midway district and along the I-94 Highway, while the proportion of non-White residents was also high in these same areas; together, this indicates a strong negative relationship between average income and the proportion of non-White residents in a neighborhood. Moreover, these same areas showed higher average household size, suggesting a negative relationship between average household size and income. More ostensible are the dramatically high housing prices and average resident age in and surrounding North Oaks, Minnesota in Northern Ramsey County.  More subtly, the Gini Index of the tracts appears higher in North Oaks and in the census tracts directly surrounding the I-94 Highway on the east side.
+
+
+```{r, include= TRUE}
+ramsey_data <- ramsey_data %>%
+  mutate(perc_nonwhite = log(perc_nonwhite)) %>%
+  mutate(north_oaks = I(geoid==27123040601))
+```
+
+```{r}
+mod_lm <- lm(house_value_e ~ perc_nonwhite + age_e+
+               income_e + gini + 
+              north_oaks + 
+               AnyHwys + household_size_e, data = ramsey_data)
+summary(mod_lm) %>%
+  tidy() %>%
+  kbl(., align = "c", caption = "OLS Model Summary", booktabs = TRUE) %>%
+  kable_styling(latex_options = c("HOLD_position", "striped"), full_width = T)
+```
+
+
+```{r, fig.height=5*1.2, fig.width=5*1.2}
+ramsey_data$lm_resid <- resid(mod_lm)
+
+lm_resid_plot <- ramsey_data %>% ggplot() +
+  geom_sf(aes(fill = lm_resid/1000)) +
+  scale_fill_gradient2(mid = "white", high = "#FC796A", low = "#5870BF") + 
+    geom_sf(data=roads_sub) +  ggtitle("OLS Models Residuals \nof Average House Prices")+
+
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_line("transparent"),
+        panel.background = element_blank(),
+        plot.title = element_text(color="black",  size = 20, face = "bold", hjust=.5),
+        legend.key.width = unit(.5, "in"),
+        legend.title = element_text(color="black", size = 12, face="bold",  hjust=.5),
+        legend.position = "bottom",
+        legend.direction="horizontal",
+        legend.text = element_text(color="black", size = 12, face="bold"))+
+    guides(fill = guide_colourbar(title = "Residual Error (per 1000 USD)", title.position="top", hjust=.5))
+
+```
+
+
+```{r, include = TRUE}
+Queen <- poly2nb(ramsey_data, queen = TRUE)
+
+ramsey_centroids <- st_centroid(st_geometry(ramsey_data),
+                                of_largest_polygon = TRUE)
+
+nb_Q_net <- nb2lines(nb = Queen, coords = ramsey_centroids, as_sf = TRUE)
+barriers <- if_else((st_intersects(nb_Q_net,roads_sub %>% 
+                                     filter(RTTYP == 'I')) %>% 
+                       lengths()) > 1,0,1)
+
+nb_Q_net$wt <- barriers
+
+G <- nb_Q_net %>% as.data.frame() %>% select(i,wt) %>% group_by(i) %>% 
+  summarize(wt = list(wt)) %>% ungroup() %>% pull(wt)
+
+W_adj <- nb2listw(Queen, glist = G)
+nb_net <- nb2lines(nb = Queen, coords = ramsey_centroids, wts = G, 
+                   as_sf = TRUE)
+```
+
+```{r}
+spdep::moran.test(ramsey_data$lm_resid, W_adj, alternative = "two.sided", 
+                  randomisation = TRUE)  %>% 
+  tidy() %>% 
+  kable( align = "c", caption = "Moran's I of OLS Residuals", 
+         booktabs = TRUE) %>% 
+  kable_styling(latex_options = c("HOLD_position", "striped"), full_width = T)
+```
+
+We performed a Moran's I test on our OLS model residuals to identify the presence of spatial clustering and validate the use of a spatial regression model. Using the above table, we found statistically significant evidence (p=0.0001684) suggesting the occurrence of meaningful spatial correlation in our data that cannot be accounted for by the OLS model. As such, we reject the null hypothesis (i.e. data are independent in space) and use our proposed SAR model to adjust for spatial correlation.
+
+```{r, include = TRUE}
+mod_sar <- spautolm(house_value_e ~ perc_nonwhite + age_e+
+               income_e + gini + 
+               north_oaks + 
+               AnyHwys + household_size_e, data = ramsey_data, listw = W_adj, 
+               family = "SAR")
+library(magrittr)
+
+summary(mod_sar) %>% coef()%>%
+  data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  as_tibble() %>%
+  magrittr::set_colnames(c("Term", "Estimate", "Std. Error", "z value", "Pr(>|z|)")) %>%
+  arrange(`Pr(>|z|)`) %>%
+  slice(7, 1:6, 8) %>%
+  kbl(., align = "c", caption = "SAR Model Summary (Ordered by Significance)", booktabs = TRUE) %>% 
+  kable_styling(latex_options = c("HOLD_position", "striped"), full_width = T)
+```
+
+Using our SAR model with $\alpha=0.05$, we found sufficient evidence to reject the null hypothesis and conclude that median income, income inequality (i.e. gini), and average household size all had significant effects on average property values, when holding relevant covariates constant. Further, we found a statistically significant difference between average property values in North Oaks from all other census tracts.
+
+While the effects of these variables are varied, we found that 1000 dollar increases in median income and 1% increases in income inequality (gini) were generally associated with increases in average property values. Similarly, we found that average house prices in North Oaks were 209286.97 dollars higher than the baseline census tract. Conversely, we found that 1 unit increases in average age and household size were associated with decreases in approximately 1600 and 1400 dollar decreases average property values, respectively.
+
+```{r, fig.height=5*1.2, fig.width=5*1.2}
+ramsey_data$sar_resid <- resid(mod_sar)
+
+sar_resid_plot <- ramsey_data %>% ggplot() +
+  geom_sf(aes(fill = sar_resid/1000)) +
+  scale_fill_gradient2(mid = "white", high = "#FC796A", low = "#5870BF") + 
+    geom_sf(data=roads_sub) +  ggtitle("SAR Models Residuals \nof Average House Prices")+
+
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid.major = element_line("transparent"),
+        panel.background = element_blank(),
+        plot.title = element_text(color="black",  size = 20, face = "bold", hjust=.5),
+        legend.key.width = unit(.5, "in"),
+        legend.title = element_text(color="black", size = 12, face="bold",  hjust=.5),
+        legend.position = "bottom",
+        legend.direction="horizontal",
+        legend.text = element_text(color="black", size = 12, face="bold"))+
+    guides(fill = guide_colourbar(title = "Residual Error (per 1000 USD)", title.position="top", hjust=.5))
+
+sar_resid_plot
+```
+
+```{r}
+spdep::moran.test(ramsey_data$sar_resid, W_adj, alternative = "two.sided", 
+                  randomisation = TRUE) %>% 
+  tidy() %>% 
+  kable( align = "c", 
+         caption = "Moran's I of SAR Residuals", booktabs = TRUE) %>% 
+  kable_styling(latex_options = c("HOLD_position", "striped"), full_width = T)  
+```
+
+Generally, our residuals of average house prices are randomly distributed across census tracts with no explicit cluster patterns. However, careful inspection of the residuals suggests slight structural differences in the quality of our predictions in the periphery of the I-94. With our currently SAR model, we tend to over-predict housing prices (blue) in census tracts north of the I-94 and under predict housing prices (red) houses south of the I-94. 
+
+Importantly, one tract— near the intersection of the I-94 and I-35E— in Southwest Ramsey County was under predicted by over $100,000; this tract is an oddity. Although it has the third highest average property value, this census tract has a dramatically lower median income than other census tracts with similar average property values.
+
+Using Moran's I test, we can assess whether the systematic errors observed in the map demonstrate sufficient statistical concern. Using the Moran's I test on our SAR residuals, we found insufficient evidence of spatial clustering in our residuals which confirms that our SAR model has improved the OLS framework and adequately adjusted for the latent spatial effects on average property values.
+
+\
+\
+
+# Conclusions
+
+
+
+Using a simultaneous autoregressive model, we characterized the variability of average property values across Ramsey County, MN and its relationships to the economic, demographic, and geographic features of Ramsey's communities. Generally, we found that the economic features of a given community were meaningfully related to average property values— this feels intuitive. However, the role of wealth in predicting house value is troubling, given the deep wealth inequities that exist throughout Minnesota and the role racial capitalism has played in the accumulation of wealth, land, and resources for White Americans.
+
+The high concentration of wealth in planned and/or mostly-white communities throughout Minnesota will be pivotal in widening the wealth gap. Future— mostly, white— generations will inherit homes in these 'desirable' neighborhoods as non-White communities are thrust into precarity by the fists of gentrification, Capitalist labor conditions, and a dwindling social security net, thus creating generational feedback loops that allow wealthy communities to inherit land and perpetuate observed racial disparities.
+
+While one might expect property values to increase according to average household size in order to accommodate larger families, our data suggests an inverse effect where average property values decrease with average household size. Together, this relationship indicates that larger families may be relegated to live in areas with lower property values— many of which are situated were once situated in 'undesirable' and 'hazardous' areas— due to the economic strains of raising a family. This result is especially troubling when we consider how average household size is associated with increased proportions of non-White citizens, meaning that non-White communities tend to live in potentially worse conditions. Income inequality had a positive relationship to property values, even after adjusting for median income. There were pronounced increased income inequality scores that demonstrate the presence of large numerical gaps in income within wealthy communities where where significantly richer individuals that inflate the Gini index in wealthy tracts also bring on higher average home values. 
+
+Although not statistically significant once accounting for economic factors, it seems that race (e.g. non-White percent) may play a factor in the geography of property values, given the geography of residual errors. Because our model errors tend to be concentrated in census tracts on the periphery of the I-94 its plausible that our weights weren't sufficiently stringent to account for latent historical factors (e.g. redlining). If that is the case, then this suggests that historical redlining may still have lasting impacts on housing values even after adjustment for current economic, structural, and demographic variables. While incorporating historic redlining classifications provides a tangible step in improving future models, it speaks to the lasting negative effects of redlining and the construction of I-94. 
+
+A critical limitation to our work is the roles that gentrification and immigration have played on morphing the economic and demographic landscape of Ramsey county. Because house prices in historically marginalized neighborhoods have been forcibly raised or indirectly raised by wealthy White people— namely, landlords, housing developers, and corporations— the exodus of low-income and non-Whtie people from Ramsey county may have decreased the sensitivity to the true effects of race and racism on property values. Our analysis is also limited by our omission of the temporality in housing prices and demography. As such, we must emphasize that our findings are only capturing a specific moment in time and not the precursors or histories (i.e. historic redlining) that have reshaped housing prices. Further, because our data is an aggregate summary of multiple homes in each census tract, our aggregate measures are implicitly tied to the variability in sampling and the sampling errors in the 2019 American Community Survey of Ramsey county.
+
+
+\
+\
+
+# Acknowledgements
+
+We'd like to thank Brianna Heggeseth for helping us along throughout this project. Specifically, we thank her sincere effort in cleaning and preparing this `tidycensus` data and for being so accommodating throughout the writing process.
+
+
+\newpage
+
+# References
+
+
+
+<div id="refs"></div>
+\newpage
