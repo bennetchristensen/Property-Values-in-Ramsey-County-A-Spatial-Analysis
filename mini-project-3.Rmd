@@ -1,5 +1,5 @@
 ---
-title: "Mini Project 3: Propery Values in Ramsey County: A Spatial Analysis"
+title: "Mini Project 3: Property Values in Ramsey County: A Spatial Analysis"
 author: "Jay Anderson, Freddy Barragan, and Ben Christensen"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
